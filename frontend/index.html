@@ -11,6 +11,36 @@
     <link rel="stylesheet" href="style.css">
 </head>
 <body>
+    <!-- ─── Warning Banner (slides down from top) ─────────────────── -->
+    <div id="warning-banner" class="warning-banner hidden">
+        <div class="warning-banner-content">
+            <div class="warning-banner-icon" id="warning-banner-icon">⚠</div>
+            <div class="warning-banner-text">
+                <strong id="warning-banner-title">Warning</strong>
+                <span id="warning-banner-message">Suspicious behavior detected</span>
+            </div>
+            <button id="warning-banner-dismiss" class="warning-banner-close" aria-label="Dismiss warning">&times;</button>
+        </div>
+    </div>
+
+    <!-- ─── Critical Warning Modal ────────────────────────────────── -->
+    <div id="critical-modal" class="critical-modal hidden">
+        <div class="critical-modal-card glass-card">
+            <div class="critical-modal-icon pulse-warning">
+                <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/>
+                    <line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>
+                </svg>
+            </div>
+            <h2 id="critical-modal-title">Critical Warning</h2>
+            <p id="critical-modal-message">A critical violation has been detected. Please return to the exam.</p>
+            <div class="critical-modal-timer">
+                Auto-dismissing in <span id="critical-countdown">10</span>s
+            </div>
+            <button id="critical-modal-ack" class="btn-critical-ack">I Understand — Return to Exam</button>
+        </div>
+    </div>
+
     <!-- ─── Header ─────────────────────────────────────────────────── -->
     <header id="app-header">
         <div class="header-left">
@@ -22,6 +52,14 @@
                 <h1>ProctorVision</h1>
             </div>
             <span class="badge">AI Proctored</span>
+            <!-- Warning count badge -->
+            <div class="warning-count-badge hidden" id="warning-count-badge">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/>
+                    <line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>
+                </svg>
+                <span id="warning-count">0</span>
+            </div>
         </div>
         <div class="header-right">
             <div class="timer" id="exam-timer">
@@ -69,6 +107,20 @@
                 <div class="webcam-header">
                     <span class="live-dot"></span>
                     <span>Webcam Feed</span>
+                    <!-- Eye Tracking Indicator -->
+                    <div class="eye-tracker-widget" id="eye-tracker-widget">
+                        <div class="eye-widget">
+                            <div class="eye-widget-ball">
+                                <div class="eye-widget-iris" id="eye-iris-left"></div>
+                            </div>
+                        </div>
+                        <div class="eye-widget">
+                            <div class="eye-widget-ball">
+                                <div class="eye-widget-iris" id="eye-iris-right"></div>
+                            </div>
+                        </div>
+                        <span class="eye-status-label" id="eye-status-label">—</span>
+                    </div>
                 </div>
                 <div class="webcam-container">
                     <video id="webcam-video" autoplay muted playsinline></video>
@@ -79,16 +131,45 @@
                 </div>
             </div>
 
-            <!-- Risk Gauge -->
-            <div class="risk-card glass-card">
-                <h3>Risk Assessment</h3>
-                <div class="gauge-container">
-                    <svg class="gauge" viewBox="0 0 200 120">
-                        <path class="gauge-bg" d="M 20 100 A 80 80 0 0 1 180 100" fill="none" stroke-width="14" stroke-linecap="round"/>
-                        <path class="gauge-fill" id="gauge-fill" d="M 20 100 A 80 80 0 0 1 180 100" fill="none" stroke-width="14" stroke-linecap="round"/>
+
+
+            <!-- Eye Metrics Card -->
+            <div class="eye-metrics-card glass-card">
+                <h3>
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/>
                     </svg>
-                    <div class="gauge-value" id="gauge-value">0</div>
-                    <div class="gauge-label" id="gauge-label">Normal</div>
+                    Eye Tracking
+                </h3>
+                <div class="eye-metrics-grid">
+                    <div class="eye-metric-item">
+                        <span class="eye-metric-label">Eye Openness</span>
+                        <div class="eye-metric-bar-wrap">
+                            <div class="eye-metric-bar" id="bar-eye-open" style="width: 80%"></div>
+                        </div>
+                        <span class="eye-metric-value" id="metric-eye-open">—</span>
+                    </div>
+                    <div class="eye-metric-item">
+                        <span class="eye-metric-label">Gaze Direction</span>
+                        <div class="gaze-compass" id="gaze-compass">
+                            <div class="gaze-compass-dot" id="gaze-compass-dot"></div>
+                        </div>
+                        <span class="eye-metric-value" id="metric-gaze-dir">center</span>
+                    </div>
+                    <div class="eye-metric-item">
+                        <span class="eye-metric-label">Gaze Velocity</span>
+                        <div class="eye-metric-bar-wrap">
+                            <div class="eye-metric-bar velocity-bar" id="bar-gaze-vel" style="width: 0%"></div>
+                        </div>
+                        <span class="eye-metric-value" id="metric-gaze-vel">0</span>
+                    </div>
+                    <div class="eye-metric-item">
+                        <span class="eye-metric-label">EAR (Blink)</span>
+                        <div class="eye-metric-bar-wrap">
+                            <div class="eye-metric-bar ear-bar" id="bar-ear" style="width: 60%"></div>
+                        </div>
+                        <span class="eye-metric-value" id="metric-ear">—</span>
+                    </div>
                 </div>
             </div>
 
@@ -120,6 +201,24 @@
                         <span class="stat-label">Face Detected</span>
                         <span class="stat-value" id="stat-face">—</span>
                     </div>
+                </div>
+            </div>
+
+            <!-- Flagged Incidents Panel -->
+            <div class="flags-card glass-card" id="flags-card">
+                <div class="flags-header" id="flags-header">
+                    <h3>
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z"/>
+                            <line x1="4" y1="22" x2="4" y2="15"/>
+                        </svg>
+                        Flagged Incidents
+                    </h3>
+                    <span class="flags-count-badge" id="flags-count-badge">0</span>
+                </div>
+                <div class="flags-list" id="flags-list">
+                    <div class="flags-empty" id="flags-empty">No incidents flagged yet</div>
+                    <!-- Populated by JS -->
                 </div>
             </div>
 

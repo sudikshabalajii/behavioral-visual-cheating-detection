@@ -4,12 +4,18 @@ Visual Feature Extractor (Webcam)
 Uses MediaPipe Face Mesh and Hands to extract visual features from
 webcam frames in real-time. Outputs feature dicts that match the
 dataset column schema for seamless model inference.
+
+Enhanced with:
+  - Eye Aspect Ratio (EAR) for blink / eye closure detection
+  - Gaze velocity for rapid eye movement detection
+  - Iris-to-eye-corner ratio for precise gaze direction
 """
 
 import cv2
 import numpy as np
 import mediapipe as mp
 import math
+import time
 
 
 class VisualExtractor:
@@ -44,6 +50,18 @@ class VisualExtractor:
         self.LEFT_EYE_OUTER = 33
         self.RIGHT_EYE_OUTER = 263
 
+        # EAR (Eye Aspect Ratio) landmark indices
+        # Left eye: 6 landmarks forming the eye contour
+        self.LEFT_EYE_EAR = [362, 385, 387, 263, 373, 380]
+        # Right eye: 6 landmarks forming the eye contour
+        self.RIGHT_EYE_EAR = [33, 160, 158, 133, 153, 144]
+
+        # Left eye inner/outer corners for iris ratio
+        self.LEFT_EYE_INNER = 362
+        self.LEFT_EYE_OUTER_IDX = 263
+        self.RIGHT_EYE_INNER = 133
+        self.RIGHT_EYE_OUTER_IDX = 33
+
         # 3D model points for head pose estimation (generic face model)
         self.model_points = np.array([
             (0.0, 0.0, 0.0),          # Nose tip
@@ -56,6 +74,11 @@ class VisualExtractor:
 
         # Corresponding landmark indices
         self.pose_landmark_ids = [1, 152, 33, 263, 61, 291]
+
+        # Gaze velocity tracking (previous frame gaze point)
+        self._prev_gaze_x = None
+        self._prev_gaze_y = None
+        self._prev_gaze_time = None
 
     def extract_features(self, frame: np.ndarray) -> dict:
         """
@@ -113,6 +136,36 @@ class VisualExtractor:
             features["pupil_right_x"] = int(right_eye.x * w)
             features["pupil_right_y"] = int(right_eye.y * h)
 
+            # ── EAR (Eye Aspect Ratio) ────────────────────────────
+            try:
+                ear_left = self._compute_ear(landmarks, self.LEFT_EYE_EAR, w, h)
+                ear_right = self._compute_ear(landmarks, self.RIGHT_EYE_EAR, w, h)
+                ear_avg = (ear_left + ear_right) / 2.0
+                features["ear_left"] = round(ear_left, 4)
+                features["ear_right"] = round(ear_right, 4)
+                features["ear_avg"] = round(ear_avg, 4)
+                features["eye_open_ratio"] = round(min(ear_avg / 0.30, 1.0), 3)
+            except Exception:
+                pass  # keep defaults from _get_default_features
+
+            # ── Iris Position Ratio (horizontal) ──────────────────
+            try:
+                iris_ratio_left = self._compute_iris_ratio(
+                    landmarks, self.LEFT_EYE_CENTER,
+                    self.LEFT_EYE_INNER, self.LEFT_EYE_OUTER_IDX, w
+                )
+                iris_ratio_right = self._compute_iris_ratio(
+                    landmarks, self.RIGHT_EYE_CENTER,
+                    self.RIGHT_EYE_INNER, self.RIGHT_EYE_OUTER_IDX, w
+                )
+                features["iris_ratio_left"] = round(iris_ratio_left, 4)
+                features["iris_ratio_right"] = round(iris_ratio_right, 4)
+                features["iris_ratio_avg"] = round(
+                    (iris_ratio_left + iris_ratio_right) / 2.0, 4
+                )
+            except Exception:
+                pass
+
             # Nose and mouth
             nose = landmarks[self.NOSE_TIP]
             mouth = landmarks[self.MOUTH_CENTER]
@@ -122,18 +175,28 @@ class VisualExtractor:
             features["mouth_y"] = mouth.y * h
 
             # Head pose estimation
-            pitch, yaw, roll = self._estimate_head_pose(landmarks, w, h)
-            features["head_pitch"] = pitch
-            features["head_yaw"] = yaw
-            features["head_roll"] = roll
-            features["head_pose"] = self._classify_head_pose(pitch, yaw)
+            try:
+                pitch, yaw, roll = self._estimate_head_pose(landmarks, w, h)
+                features["head_pitch"] = pitch
+                features["head_yaw"] = yaw
+                features["head_roll"] = roll
+                features["head_pose"] = self._classify_head_pose(pitch, yaw)
+            except Exception:
+                features["head_pose"] = "forward"
 
             # Gaze direction
             gaze_x, gaze_y = self._estimate_gaze_point(landmarks, w, h)
             features["gazePoint_x"] = int(gaze_x)
             features["gazePoint_y"] = int(gaze_y)
-            features["gaze_direction"] = self._classify_gaze(gaze_x, gaze_y, w, h)
+            features["gaze_direction"] = self._classify_gaze(features.get("iris_ratio_avg", 0.5))
             features["gaze_on_script"] = 1 if features["gaze_direction"] == "center" else 0
+
+            # ── Gaze Velocity ─────────────────────────────────────
+            try:
+                gaze_velocity = self._compute_gaze_velocity(gaze_x, gaze_y)
+                features["gaze_velocity"] = round(gaze_velocity, 2)
+            except Exception:
+                pass
 
         # ── Hand Detection ────────────────────────────────────────────
         hand_results = self.hands.process(rgb_frame)
@@ -189,6 +252,12 @@ class VisualExtractor:
             "gazePoint_x": 0, "gazePoint_y": 0,
             "pupil_left_x": 0, "pupil_left_y": 0,
             "pupil_right_x": 0, "pupil_right_y": 0,
+            # Enhanced eye metrics
+            "ear_left": 0.0, "ear_right": 0.0, "ear_avg": 0.0,
+            "eye_open_ratio": 0.0,
+            "iris_ratio_left": 0.5, "iris_ratio_right": 0.5,
+            "iris_ratio_avg": 0.5,
+            "gaze_velocity": 0.0,
         }
 
     def _estimate_head_pose(self, landmarks, w, h) -> tuple:
@@ -220,9 +289,11 @@ class VisualExtractor:
             return 0.0, 0.0, 0.0
 
         rotation_mat, _ = cv2.Rodrigues(rotation_vec)
-        pose_mat = cv2.hconcat([rotation_mat, translation_vec])
+        # Build 3x4 projection matrix, then add [0,0,0,1] row for 4x4
+        pose_mat = np.hstack([rotation_mat, translation_vec])
+        proj_mat = np.vstack([pose_mat, np.array([0, 0, 0, 1], dtype=np.float64)])
         _, _, _, _, _, _, euler_angles = cv2.decomposeProjectionMatrix(
-            cv2.hconcat([pose_mat, np.array([[0, 0, 0, 1]])])
+            proj_mat[:3, :]  # decomposeProjectionMatrix expects 3x4
         )
 
         pitch = euler_angles[0, 0] / 100.0
@@ -233,9 +304,9 @@ class VisualExtractor:
 
     def _classify_head_pose(self, pitch: float, yaw: float) -> str:
         """Classify head direction from pitch and yaw angles."""
-        if abs(yaw) > 0.03:
+        if abs(yaw) > 0.15:
             return "right" if yaw > 0 else "left"
-        if pitch < -0.02:
+        if pitch < -0.15:
             return "down"
         return "forward"
 
@@ -251,27 +322,89 @@ class VisualExtractor:
 
         return gaze_x, gaze_y
 
-    def _classify_gaze(self, gx, gy, w, h) -> str:
+    def _classify_gaze(self, iris_ratio_avg: float) -> str:
         """
-        Classify gaze into directional regions.
-        Screen divided into 3×2 grid: top/bottom × left/center/right.
+        Classify gaze into directional regions using iris ratio.
         """
-        x_third = w / 3
-        y_half = h / 2
+        if iris_ratio_avg < 0.40:
+            return "right"
+        elif iris_ratio_avg > 0.60:
+            return "left"
+        return "center"
 
-        if gx < x_third:
-            h_dir = "left"
-        elif gx > 2 * x_third:
-            h_dir = "right"
-        else:
-            h_dir = "center"
+    def _compute_ear(self, landmarks, eye_indices, w, h) -> float:
+        """
+        Compute Eye Aspect Ratio (EAR) for blink detection.
 
-        v_dir = "top" if gy < y_half else "bottom"
+        EAR = (|p2-p6| + |p3-p5|) / (2 * |p1-p4|)
 
-        if h_dir == "center" and abs(gy - y_half) < y_half * 0.3:
-            return "center"
+        Where p1-p6 are the 6 eye contour landmarks:
+          p1 = outer corner, p4 = inner corner
+          p2, p3 = upper lid, p5, p6 = lower lid
+        """
+        def _dist(a, b):
+            ax, ay = landmarks[a].x * w, landmarks[a].y * h
+            bx, by = landmarks[b].x * w, landmarks[b].y * h
+            return math.sqrt((ax - bx) ** 2 + (ay - by) ** 2)
 
-        return f"{v_dir}_{h_dir}" if h_dir != "center" else "center"
+        p1, p2, p3, p4, p5, p6 = eye_indices
+
+        # Vertical distances
+        vert1 = _dist(p2, p6)
+        vert2 = _dist(p3, p5)
+
+        # Horizontal distance
+        horiz = _dist(p1, p4)
+
+        if horiz < 1e-6:
+            return 0.0
+
+        ear = (vert1 + vert2) / (2.0 * horiz)
+        return ear
+
+    def _compute_iris_ratio(self, landmarks, iris_idx, inner_idx, outer_idx, w) -> float:
+        """
+        Compute horizontal iris position ratio within the eye.
+
+        Returns 0.0 (looking right) to 1.0 (looking left), ~0.5 = center.
+        """
+        iris_x = landmarks[iris_idx].x * w
+        inner_x = landmarks[inner_idx].x * w
+        outer_x = landmarks[outer_idx].x * w
+
+        eye_width = abs(outer_x - inner_x)
+        if eye_width < 1e-6:
+            return 0.5
+
+        ratio = (iris_x - min(inner_x, outer_x)) / eye_width
+        return max(0.0, min(1.0, ratio))
+
+    def _compute_gaze_velocity(self, gaze_x: float, gaze_y: float) -> float:
+        """
+        Compute gaze velocity (pixels/second) from previous frame.
+        """
+        now = time.time()
+
+        if self._prev_gaze_x is None:
+            self._prev_gaze_x = gaze_x
+            self._prev_gaze_y = gaze_y
+            self._prev_gaze_time = now
+            return 0.0
+
+        dt = now - self._prev_gaze_time
+        if dt < 1e-6:
+            return 0.0
+
+        dx = gaze_x - self._prev_gaze_x
+        dy = gaze_y - self._prev_gaze_y
+        distance = math.sqrt(dx ** 2 + dy ** 2)
+        velocity = distance / dt
+
+        self._prev_gaze_x = gaze_x
+        self._prev_gaze_y = gaze_y
+        self._prev_gaze_time = now
+
+        return velocity
 
     def release(self):
         """Release MediaPipe resources."""
@@ -302,8 +435,9 @@ if __name__ == "__main__":
             f"Head: {features['head_pose']}",
             f"Gaze: {features['gaze_direction']}",
             f"Hands: {features['hand_count']}",
-            f"Pitch: {features['head_pitch']:.3f}",
-            f"Yaw: {features['head_yaw']:.3f}",
+            f"EAR: {features['ear_avg']:.3f}",
+            f"Iris: {features['iris_ratio_avg']:.3f}",
+            f"Gaze Vel: {features['gaze_velocity']:.1f}",
         ]
         for i, text in enumerate(info_text):
             cv2.putText(frame, text, (10, 30 + i * 25),

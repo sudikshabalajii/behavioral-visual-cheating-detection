@@ -52,6 +52,23 @@ def prepare_realtime_input(
     # Build a DataFrame from the single feature dict
     df = pd.DataFrame([frame_features])
 
+    # Compute engineered features for real-time inference
+    if "gazePoint_x" in df.columns and "gazePoint_y" in df.columns:
+        df["gaze_deviation"] = np.sqrt((df["gazePoint_x"] - 320) ** 2 + (df["gazePoint_y"] - 240) ** 2)
+    if "pupil_left_x" in df.columns and "pupil_right_x" in df.columns:
+        df["eye_distance"] = np.sqrt((df["pupil_left_x"] - df["pupil_right_x"]) ** 2 + (df["pupil_left_y"] - df["pupil_right_y"]) ** 2)
+    if "face_w" in df.columns and "face_h" in df.columns:
+        df["face_area"] = df["face_w"] * df["face_h"]
+    if "head_pitch" in df.columns and "head_yaw" in df.columns and "head_roll" in df.columns:
+        df["head_movement_magnitude"] = np.sqrt(df["head_pitch"] ** 2 + df["head_yaw"] ** 2 + df["head_roll"] ** 2)
+    if "hand_count" in df.columns and "hand_obj_interaction" in df.columns:
+        df["hand_risk_score"] = df["hand_count"] + df["hand_obj_interaction"] + df.get("phone_present", 0) * 2
+    if "left_eye_x" in df.columns and "right_eye_x" in df.columns and "mouth_x" in df.columns:
+        eye_mid_x = (df["left_eye_x"] + df["right_eye_x"]) / 2
+        eye_mid_y = (df["left_eye_y"] + df["right_eye_y"]) / 2
+        df["eye_mouth_distance"] = np.sqrt((eye_mid_x - df["mouth_x"]) ** 2 + (eye_mid_y - df["mouth_y"]) ** 2)
+        df["nose_eye_offset"] = np.abs(df.get("nose_tip_x", 0) - eye_mid_x)
+
     # One-hot encode categorical columns
     categorical_cols = ["head_pose", "gaze_direction"]
     for col in categorical_cols:
@@ -65,7 +82,10 @@ def prepare_realtime_input(
             df[fname] = 0
 
     # Remove any extra columns and reorder
+    df = df.loc[:, ~df.columns.duplicated()] # Remove duplicates if any!
     df = df[feature_names]
+    
+    print(f"DEBUG: df shape before scaler: {df.shape}")
 
     # Normalize using the fitted scaler
     X = df.values.astype(np.float32)

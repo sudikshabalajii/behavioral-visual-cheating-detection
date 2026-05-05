@@ -9,6 +9,8 @@ Endpoints:
   GET  /health     → Health check
   POST /predict    → Single prediction (features or base64 frame)
   POST /predict/batch → Batch prediction
+  GET  /flags      → Get all flagged suspicious events
+  POST /flags/clear → Clear flagged events
 """
 
 import os
@@ -28,6 +30,8 @@ sys.path.insert(0, PROJECT_ROOT)
 from scoring.risk_scorer import RiskScorer, compute_risk_score, classify_risk, get_risk_color
 from models.feature_fusion import prepare_realtime_input
 from webcam.visual_extractor import VisualExtractor
+from webcam.behavior_analyzer import BehaviorAnalyzer
+from webcam.feature_utils import GazeTracker
 
 # ─── App Setup ────────────────────────────────────────────────────────
 app = Flask(
@@ -44,11 +48,14 @@ encoders = None
 feature_names = None
 risk_scorer = None
 visual_extractor = None
+behavior_analyzer = None
+gaze_tracker = None
 
 
 def load_models():
     """Load all saved model artifacts on startup."""
-    global model, scaler, encoders, feature_names, risk_scorer, visual_extractor
+    global model, scaler, encoders, feature_names, risk_scorer
+    global visual_extractor, behavior_analyzer, gaze_tracker
 
     print("[API] Loading model artifacts...")
 
@@ -84,6 +91,14 @@ def load_models():
     except Exception as e:
         print(f"[API] WARNING: Could not initialize visual extractor: {e}")
 
+    # Initialize behavior analyzer
+    behavior_analyzer = BehaviorAnalyzer()
+    print("[API] Behavior analyzer initialized")
+
+    # Initialize gaze tracker for temporal analysis
+    gaze_tracker = GazeTracker(window_size=30)
+    print("[API] Gaze tracker initialized")
+
 
 # ─── Routes ───────────────────────────────────────────────────────────
 
@@ -106,6 +121,7 @@ def health_check():
         "status": "healthy",
         "model_loaded": model is not None,
         "features_count": len(feature_names) if feature_names else 0,
+        "behavior_analyzer": behavior_analyzer is not None,
     })
 
 
@@ -120,7 +136,7 @@ def predict():
       - "raw_features": dict of named features (raw, will be processed)
 
     Returns:
-        JSON with prediction, risk_score, risk_level
+        JSON with prediction, risk_score, risk_level, warnings, eye_metrics
     """
     if risk_scorer is None:
         return jsonify({"error": "Model not loaded. Run training first."}), 503
@@ -134,6 +150,8 @@ def predict():
         if "features" in data:
             features = np.array(data["features"], dtype=np.float32).reshape(1, -1)
             result = risk_scorer.predict_risk(features)
+            result["warnings"] = []
+            result["eye_metrics"] = {}
             return jsonify(result)
 
         # Option 2: Base64-encoded webcam frame
@@ -149,10 +167,19 @@ def predict():
             if frame is None:
                 return jsonify({"error": "Could not decode frame"}), 400
 
-            # Extract visual features
+            # Extract visual features (now includes EAR, iris ratio, gaze velocity)
             frame_features = visual_extractor.extract_features(frame)
 
-            # Convert to model input
+            # Update gaze tracker with temporal data
+            if gaze_tracker:
+                gaze_tracker.update(frame_features)
+
+            # ── Behavior Analysis ─────────────────────────────────
+            warnings = []
+            if behavior_analyzer:
+                warnings = behavior_analyzer.analyze_frame(frame_features)
+
+            # Convert to model input (filter to only trained features)
             features = prepare_realtime_input(
                 frame_features, scaler, encoders, feature_names
             )
@@ -162,11 +189,39 @@ def predict():
             # Add extracted features summary to response
             result["extracted_features"] = {
                 "face_present": frame_features["face_present"],
+                "no_of_face": frame_features.get("no_of_face", 0),
                 "head_pose": frame_features["head_pose"],
                 "gaze_direction": frame_features["gaze_direction"],
                 "gaze_on_script": frame_features["gaze_on_script"],
                 "hand_count": frame_features["hand_count"],
+                "hand_obj_interaction": frame_features.get("hand_obj_interaction", 0),
             }
+
+            # Add enhanced eye metrics
+            result["eye_metrics"] = {
+                "ear_left": frame_features.get("ear_left", 0),
+                "ear_right": frame_features.get("ear_right", 0),
+                "ear_avg": frame_features.get("ear_avg", 0),
+                "eye_open_ratio": frame_features.get("eye_open_ratio", 0),
+                "iris_ratio_left": frame_features.get("iris_ratio_left", 0.5),
+                "iris_ratio_right": frame_features.get("iris_ratio_right", 0.5),
+                "iris_ratio_avg": frame_features.get("iris_ratio_avg", 0.5),
+                "gaze_velocity": frame_features.get("gaze_velocity", 0),
+            }
+
+            # Add behavioral warnings
+            result["warnings"] = warnings
+            if warnings:
+                print(f"DEBUG WARNINGS: {[w['message'] for w in warnings]}", flush=True)
+
+            # Add warning summary
+            if behavior_analyzer:
+                result["warning_summary"] = behavior_analyzer.get_warning_summary()
+
+            # Add gaze tracker window stats
+            if gaze_tracker:
+                result["gaze_stats"] = gaze_tracker.get_window_stats()
+
             return jsonify(result)
 
         # Option 3: Raw named features (dict)
@@ -176,6 +231,8 @@ def predict():
                 frame_features, scaler, encoders, feature_names
             )
             result = risk_scorer.predict_risk(features)
+            result["warnings"] = []
+            result["eye_metrics"] = {}
             return jsonify(result)
 
         else:
@@ -184,6 +241,8 @@ def predict():
             }), 400
 
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
 
@@ -218,10 +277,31 @@ def predict_batch():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/flags", methods=["GET"])
+def get_flags():
+    """Return all flagged suspicious events for the current session."""
+    if behavior_analyzer is None:
+        return jsonify({"flags": [], "summary": {}})
+
+    return jsonify({
+        "flags": behavior_analyzer.get_all_flags(),
+        "summary": behavior_analyzer.get_warning_summary(),
+    })
+
+
+@app.route("/flags/clear", methods=["POST"])
+def clear_flags():
+    """Clear the flagged events log."""
+    if behavior_analyzer:
+        behavior_analyzer.clear_flags()
+    return jsonify({"status": "cleared"})
+
+
 # ─── Main ─────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     load_models()
     print("\n[API] Starting server on http://localhost:5000")
     print("[API] Frontend: http://localhost:5000/")
     print("[API] Health: http://localhost:5000/health")
+    print("[API] Flags: http://localhost:5000/flags")
     app.run(host="0.0.0.0", port=5000, debug=False)
